@@ -24,3 +24,28 @@ def resolve_db(arg, repo):
     if not db.exists():
         sys.exit(f"error: database not found: {db} (run `oura sync` first)")
     return db
+
+
+RUNNER_VERSION = 1
+
+
+def emit_json(payload):
+    """Print a runner payload with the version stamp every consumer checks."""
+    import json
+    import sys
+    print(json.dumps({"runner_version": RUNNER_VERSION, **payload}, indent=2))
+    sys.stdout.flush()
+
+
+def fail_no_data(kind, message):
+    """Exit 3 with a structured diagnosis of missing input.
+
+    Distinct from a crash on purpose: a consumer can tell "this database has no
+    MET events" from "the model blew up", and say so, instead of showing a
+    traceback for a condition the user can fix.
+    """
+    import json
+    import sys
+    print(json.dumps({"runner_version": RUNNER_VERSION,
+                      "error": {"kind": kind, "message": message}}))
+    raise SystemExit(3)

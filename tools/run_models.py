@@ -5,7 +5,8 @@ Harness that maps decoded events -> each model's forward() inputs. Only the
 models whose inputs we can supply from synced data are wired here; see
 docs/model-usage-map / the feasibility matrix for what's blocked and why.
 
-Usage: python tools/run_models.py <model> [DB] [--tz H]
+Usage: python tools/run_models.py <model> [DB] [--tz H] [--json]
+                                  [--start-ds N --end-ds N]
   model = bdi | daily_medians | all
 (sleepnet_moonstone has its own runner: tools/run_sleep_model.py)
 """
@@ -17,7 +18,7 @@ from pathlib import Path
 
 import torch
 
-from _common import resolve_db
+from _common import emit_json, fail_no_data, resolve_db
 
 REPO = Path(__file__).resolve().parent.parent
 MODELS = REPO / "notes" / "models"
@@ -52,17 +53,24 @@ def last_bedtime(rows):
     """Most recent bedtime_period dict, or a clear error if none were synced."""
     beds = [json.loads(j) for ds, n, j, _ in rows if n == "bedtime_period"]
     if not beds:
-        sys.exit("no bedtime_period (tag 0x76) in DB — sync overnight data first")
+        fail_no_data(
+            "no_bedtime",
+            "no bedtime_period (tag 0x76) in the database, and no explicit "
+            "window was given")
     return beds[-1]
 
 
 # ---- sleepnet_bdi_0_4_0: bedtime_input, ibi_values, ibi_timestamps ----
-def run_bdi(db, tz):
+def run_bdi(db, tz, start_ds=None, end_ds=None, as_json=False):
     rows = events(db)
     unix_s = anchor(rows)
-    bp = last_bedtime(rows)
-    bstart = unix_s(bp["bedtime_start_ds"])
-    bend = unix_s(bp["bedtime_end_ds"])
+    # An explicit window wins: the caller may have resolved a night this
+    # database holds no bedtime_period for.
+    if start_ds is None or end_ds is None:
+        bp = last_bedtime(rows)
+        start_ds, end_ds = bp["bedtime_start_ds"], bp["bedtime_end_ds"]
+    bstart = unix_s(start_ds)
+    bend = unix_s(end_ds)
     # IBIs within the sleep window (absolute beat timeline by cumulative IBI)
     # ibi_values = [ibi_ms, amplitude, quality(1=valid)]; timestamps passed separately.
     ibi_rows, ibi_t = [], []
@@ -86,9 +94,11 @@ def run_bdi(db, tz):
                 acc += ms  # a beat occurs at the END of its interval
                 ibi_t.append((t0 * 1000.0) + acc)  # ms
     local = lambda s: datetime.datetime.utcfromtimestamp(s + tz * 3600).strftime("%Y-%m-%d %H:%M")
-    print(f"bedtime {local(bstart)} → {local(bend)} ({(bend-bstart)/3600:.2f} h), {len(ibi_rows)} IBIs")
+    # Progress chatter goes to stderr under --json so stdout stays parseable.
+    print(f"bedtime {local(bstart)} → {local(bend)} ({(bend-bstart)/3600:.2f} h), {len(ibi_rows)} IBIs",
+          file=sys.stderr if as_json else sys.stdout)
     if not ibi_rows:
-        sys.exit("no valid IBI in the sleep window — sync overnight IBI (0x60/0x80) data first")
+        fail_no_data("no_ibi", "no valid IBI (tag 0x60/0x80) in the sleep window")
     m = load("sleepnet_bdi_0_4_0")
     bedtime_input = torch.tensor([int(bstart * 1000), int(bend * 1000)], dtype=torch.long)
     ibi_vals = f32(ibi_rows)  # [N,3]
@@ -101,14 +111,40 @@ def run_bdi(db, tz):
     stage = sleep_stages[:, 1:5].argmax(dim=1)
     n = stage.shape[0]
     if n == 0:
-        sys.exit("SleepNet-BDI returned zero epochs for this window")
+        fail_no_data(
+            "no_epochs",
+            "the breathing model returned zero epochs for this window")
     labels = ["awake", "light", "REM", "deep"]
+    apnea = apnea_events[:, 0]
+    flagged = int((apnea > 0.5).sum())
+
+    if as_json:
+        # Column order is the model's own, [AWAKE, LIGHT, REM, DEEP]; the
+        # consumer normalises it against moonstone's vocabulary.
+        names = ["AWAKE", "LIGHT", "REM", "DEEP"]
+        total_min = n * 30 / 60
+        emit_json({
+            "model": "sleepnet_bdi_0_4_0",
+            "window_ds": [start_ds, end_ds],
+            "epochs": n,
+            "epoch_sec": 30,
+            "stages": {
+                name: {"min": round(int((stage == s).sum()) * 30 / 60),
+                       "pct": round(100 * int((stage == s).sum()) / n)}
+                for s, name in enumerate(names)
+            },
+            "apnea_epochs_flagged": flagged,
+            "apnea_index_per_hr": round(flagged / (n * 30 / 3600), 2) if n else 0.0,
+            "output_metrics": [round(x, 3) for x in out_metrics.flatten().tolist()],
+            "debug_metrics": [round(x, 3) for x in dbg_metrics.flatten().tolist()],
+        })
+        return
+
     print(f"\nHypnogram: {n} epochs x 30s = {n*30/60:.0f} min")
     for s in range(4):
         c = int((stage == s).sum())
         print(f"  col{s+1} {labels[s]:8}: {c:4d} epochs ({c*30/60:5.1f} min, {100*c/n:4.1f}%)")
-    apnea = apnea_events[:, 0]
-    print(f"\napneaEvents: {int((apnea > 0.5).sum())} epochs flagged (>0.5) of {n}")
+    print(f"\napneaEvents: {flagged} epochs flagged (>0.5) of {n}")
     print(f"outputMetrics: {[round(x, 3) for x in out_metrics.flatten().tolist()]}")
     print(f"debugMetrics:  {[round(x, 3) for x in dbg_metrics.flatten().tolist()]}")
 
@@ -161,15 +197,27 @@ def run_daily_medians(db, _tz):  # no wall-clock output → tz unused here
 RUNNERS = {"bdi": run_bdi, "daily_medians": run_daily_medians}
 
 
+def _take_value(argv, flag, cast):
+    """Strip `flag VALUE` out of argv so its value is not read as the DB path."""
+    if flag not in argv:
+        return None
+    i = argv.index(flag)
+    if i + 1 >= len(argv):
+        sys.exit(f"{flag} requires a value")
+    value = cast(argv[i + 1])
+    del argv[i:i + 2]
+    return value
+
+
 def main():
     argv = sys.argv[1:]
-    tz = 1
-    if "--tz" in argv:  # strip "--tz H" so its value isn't mistaken for the DB path
-        i = argv.index("--tz")
-        if i + 1 >= len(argv):
-            sys.exit("--tz requires a value")
-        tz = int(argv[i + 1])
-        del argv[i:i + 2]
+    as_json = "--json" in argv
+    if as_json:
+        argv.remove("--json")
+    tz = _take_value(argv, "--tz", float)
+    tz = 1 if tz is None else tz
+    start_ds = _take_value(argv, "--start-ds", int)
+    end_ds = _take_value(argv, "--end-ds", int)
     model = argv[0] if argv else "bdi"
     db_arg = next((a for a in argv[1:] if not a.startswith("-")), None)
     db = str(resolve_db(db_arg, REPO))
@@ -183,7 +231,10 @@ def main():
         return
     if model not in RUNNERS:
         sys.exit(f"unknown model '{model}' (choose: {', '.join(RUNNERS)} | all)")
-    RUNNERS[model](db, tz)
+    if model == "bdi":
+        run_bdi(db, tz, start_ds, end_ds, as_json)
+    else:
+        RUNNERS[model](db, tz)
 
 
 if __name__ == "__main__":

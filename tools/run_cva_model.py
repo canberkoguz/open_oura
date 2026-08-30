@@ -21,6 +21,7 @@ meaningful number. daily_pwv (m/s) is PPG-only.
 
 Usage: python tools/run_cva_model.py [DB] [--sex M|F|O] [--age Y] [--height M]
                                       [--weight KG] [--ring N] [--since-cursor DS]
+                                      [--json]
 """
 import argparse
 import sqlite3
@@ -30,7 +31,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from _common import resolve_db
+from _common import emit_json, fail_no_data, resolve_db
 
 REPO = Path(__file__).resolve().parent.parent
 MODEL = REPO / "notes" / "models" / "cva_2_1_5.pt"
@@ -47,7 +48,10 @@ def build_segments(db, since_ds):
     ).fetchall()
     con.close()
     if not rows:
-        sys.exit("no cva_raw_ppg_data (tag 0x81) events — is cva_ppg enabled? (oura feature-status)")
+        fail_no_data(
+            "no_ppg",
+            "no cva_raw_ppg_data (tag 0x81) events — is the cva_ppg feature "
+            "enabled?")
     ts = np.array([r[0] for r in rows])
     # split into contiguous measurement runs, cumsum each, chunk into 1500
     runs, cur = [], [0]
@@ -75,13 +79,17 @@ def main():
     p.add_argument("--weight", type=float, default=75.0, help="kg")
     p.add_argument("--ring", type=float, default=10.0, help="ring size")
     p.add_argument("--since-cursor", type=int, default=0, help="only events with ring_timestamp > this")
+    p.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of a table")
     args = p.parse_args()
     if not MODEL.exists():
         sys.exit(f"model not found: {MODEL}")
 
     segs, n_runs = build_segments(resolve_db(args.db, REPO), args.since_cursor)
     if not segs:
-        sys.exit(f"no full {SEG_LEN}-sample PPG segment available ({n_runs} measurement runs, all too short)")
+        fail_no_data(
+            "no_segments",
+            f"no full {SEG_LEN}-sample PPG segment available ({n_runs} "
+            f"measurement runs, all too short)")
     ppg = torch.tensor(np.stack(segs), dtype=torch.float32)
     sex = {"F": -1.0, "M": 1.0, "O": 0.0}[args.sex]
     demo = torch.tensor([[sex, args.height, args.age, args.ring, args.weight]], dtype=torch.float32)
@@ -89,6 +97,18 @@ def main():
     m = torch.jit.load(str(MODEL), map_location="cpu").eval()
     with torch.no_grad():
         cva, quality, raw_quality, pwv, seg_metrics = m(ppg, demo)
+
+    if args.json:
+        emit_json({
+            "model": "cva_2_1_5",
+            "vascular_age_years": round(float(cva.item()), 1),
+            "pwv_m_s": round(float(pwv.item()), 2),
+            "quality": round(float(quality.item()), 3),
+            "raw_quality": round(float(raw_quality.item()), 3),
+            "n_segments": int(ppg.shape[0]),
+            "n_measurements": n_runs,
+        })
+        raise SystemExit(0)
 
     print(f"CVA (cardiovascular age) — {ppg.shape[0]} PPG segments from {n_runs} measurements")
     print(f"  demographics: sex={args.sex} age={args.age:.0f} height={args.height} weight={args.weight} ring={args.ring}")

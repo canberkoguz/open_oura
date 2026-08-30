@@ -6,31 +6,56 @@ Inputs from the SQLite event log: IBI (0x60), motion_seconds (0x47), temp (0x46)
 bedtime (0x76). SpO2 passed empty (we only have R-ratio, not %). Time axis is the
 device-relative deciseconds anchored to the latest event's captured_unix.
 
-Usage: python tools/run_sleep_model.py START_DS END_DS [DB] [TZ=1]
-       (no args → uses the bedtime_period in the DB)
+Usage: python tools/run_sleep_model.py [--start-ds N --end-ds N] [DB] [--tz H]
+                                       [--json]
+       (no window → uses the bedtime_period in the DB)
+       legacy positional form START_DS END_DS [DB] [TZ] still works
 """
-import sys, json, sqlite3, datetime
+import argparse, sys, json, sqlite3, datetime
 from pathlib import Path
 import torch
 
-from _common import resolve_db
+from _common import emit_json, fail_no_data, resolve_db
 
 REPO = Path(__file__).resolve().parent.parent
 TZ = 1
 MODEL = str(REPO / "notes" / "models" / "sleepnet_moonstone_1_2_0.pt")
 STAGE = {1: "DEEP", 2: "LIGHT", 3: "REM", 4: "WAKE"}
 
-args = [a for a in sys.argv[1:]]
-start_ds = end_ds = None
-if len(args) >= 2 and args[0].isdigit():
-    start_ds, end_ds = int(args[0]), int(args[1])
-    rest = args[2:]
-else:
-    rest = args
-db_arg = rest[0] if rest else None
-if len(rest) > 1:
-    TZ = int(rest[1])
-DB = resolve_db(db_arg, REPO)
+# The legacy positional form `START_DS END_DS [DB] [TZ]` is peeled off before
+# argparse sees it: argparse would bind the first number to `db` and the pair
+# would never be recognised as a window.
+raw = sys.argv[1:]
+legacy_window = legacy_db = legacy_tz = None
+if len(raw) >= 2 and raw[0].isdigit() and raw[1].isdigit():
+    legacy_window = (int(raw[0]), int(raw[1]))
+    tail = raw[2:]
+    legacy_db = tail[0] if tail else None
+    legacy_tz = float(tail[1]) if len(tail) > 1 else None
+    raw = []
+
+p = argparse.ArgumentParser()
+p.add_argument("db", nargs="?", default=None)
+p.add_argument("--start-ds", type=int, default=None)
+p.add_argument("--end-ds", type=int, default=None)
+p.add_argument("--tz", type=float, default=1.0)
+p.add_argument("--json", action="store_true")
+args = p.parse_args(raw)
+if legacy_window is not None:
+    args.start_ds, args.end_ds = legacy_window
+    args.db = legacy_db
+    if legacy_tz is not None:
+        args.tz = legacy_tz
+
+start_ds, end_ds = args.start_ds, args.end_ds
+TZ = args.tz
+AS_JSON = args.json
+DB = resolve_db(args.db, REPO)
+
+
+def note(*parts, **kwargs):
+    """Progress chatter. Goes to stderr under --json so stdout stays parseable."""
+    print(*parts, file=sys.stderr if AS_JSON else sys.stdout, **kwargs)
 
 con = sqlite3.connect(str(DB))
 rows = con.execute("SELECT ring_timestamp, tag, decoded_json, captured_unix FROM events "
@@ -42,7 +67,10 @@ def ms(ds):  # device deciseconds -> absolute epoch ms (int64), consistent acros
 if start_ds is None:  # default: most recent bedtime_period in the DB (matches run_models.last_bedtime)
     bt = con.execute("SELECT decoded_json FROM events WHERE tag=118 ORDER BY ring_timestamp DESC").fetchone()
     if bt is None:
-        raise SystemExit("no bedtime_period (tag 0x76) in DB — pass start/end deciseconds or sync overnight data first")
+        fail_no_data(
+            "no_bedtime",
+            "no bedtime_period (tag 0x76) in the database, and no explicit "
+            "window was given")
     v = json.loads(bt[0])
     start_ds, end_ds = v["bedtime_start_ds"], v["bedtime_end_ds"]
 
@@ -67,10 +95,10 @@ for ds, tag, js, _ in rows:
         temp.append((ms(ds), float(v["temps_c"][0])))
 
 beats.sort(); acm.sort(); temp.sort()
-print(f"window ds [{start_ds}..{end_ds}] ({(end_ds-start_ds)/10/3600:.1f}h)  "
-      f"beats={len(beats)} acm={len(acm)} temp={len(temp)}")
+note(f"window ds [{start_ds}..{end_ds}] ({(end_ds-start_ds)/10/3600:.1f}h)  "
+     f"beats={len(beats)} acm={len(acm)} temp={len(temp)}")
 if not beats or not any(b[3] == 1 for b in beats):
-    sys.exit("not enough valid IBI in this window")
+    fail_no_data("no_ibi", "no valid IBI (tag 0x60/0x80) in this sleep window")
 
 def col(seq, i):
     return [r[i] for r in seq]
@@ -95,9 +123,33 @@ with torch.no_grad():
 stages = [int(s) for s in staging[:, 0].tolist()]
 n = len(stages)
 if n == 0:
-    sys.exit("SleepNet-moonstone returned zero epochs for this window")
+    fail_no_data(
+        "no_epochs",
+        "the sleep model returned zero epochs for this window — it is too "
+        "short or too sparse to stage")
 mins = {k: stages.count(c) * 0.5 for c, k in STAGE.items()}
 asleep = n * 0.5 - mins["WAKE"]
+in_bed = n * 0.5
+
+if AS_JSON:
+    emit_json({
+        "model": "sleepnet_moonstone_1_2_0",
+        "window_ds": [start_ds, end_ds],
+        "epochs": n,
+        "epoch_sec": 30,
+        "in_bed_min": round(in_bed),
+        "asleep_min": round(asleep),
+        "efficiency_pct": round(100 * asleep / in_bed) if in_bed else 0,
+        "stages": {
+            name: {"min": round(minutes),
+                   "pct": round(100 * minutes / in_bed) if in_bed else 0}
+            for name, minutes in mins.items()
+        },
+        # Per-epoch stage ids, the model's own: 1=DEEP 2=LIGHT 3=REM 4=WAKE.
+        "hypnogram": stages,
+    })
+    raise SystemExit(0)
+
 print(f"\nHypnogram: {n} epochs = {n*0.5:.0f} min in bed")
 for k in ["DEEP", "LIGHT", "REM", "WAKE"]:
     pct = 100 * mins[k] / (n * 0.5) if n else 0

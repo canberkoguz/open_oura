@@ -10,7 +10,8 @@ This is the engine behind `oura sessions` (the Rust CLI shells out to it).
 
 Usage:
     python tools/run_activity_model.py [DB] [--tz HOURS] [--threshold P]
-                                       [--json] [--verbose]
+                                       [--age Y] [--sex M|F|O] [--height M]
+                                       [--weight KG] [--json] [--verbose]
 
 `DB` defaults to ./oura.db (then captures/ring5.db). Requires `torch` in the
 venv (CPU is fine). The model lives in `notes/models/`.
@@ -31,7 +32,7 @@ import warnings
 
 import torch
 
-from _common import resolve_db
+from _common import emit_json, fail_no_data, resolve_db
 
 # The model triggers a benign non-contiguous torch.searchsorted perf warning.
 warnings.filterwarnings("ignore", message=".*searchsorted.*")
@@ -63,6 +64,12 @@ def parse_args():
     p.add_argument("--tz", type=float, default=1.0, help="Timezone offset hours from UTC for display (default 1)")
     p.add_argument("--threshold", type=float, default=0.5, help="is_workout probability marked as a workout (default 0.5)")
     p.add_argument("--min-duration", type=float, default=5.0, help="Minimum segment minutes the model emits (default 5)")
+    # Demographics rather than one hardcoded body: the model's energy terms
+    # scale with size, so a stranger's numbers shift every bout's probability.
+    p.add_argument("--age", type=float, default=30.0, help="years")
+    p.add_argument("--sex", choices=["M", "F", "O"], default="O")
+    p.add_argument("--height", type=float, default=1.78, help="meters")
+    p.add_argument("--weight", type=float, default=78.0, help="kg")
     p.add_argument("--json", action="store_true", help="Emit machine-readable JSON instead of a table")
     p.add_argument("--verbose", action="store_true", help="Print input series ranges (debug)")
     # back-compat: old positional `[DB] [TZ]`
@@ -139,7 +146,9 @@ def main():
 
     met = sorted({round(t): (t, m) for t, m in met}.values())
     if not met:
-        sys.exit("no MET (activity_information / tag 0x50) events in DB — cannot run the activity model")
+        fail_no_data(
+            "no_met",
+            "no MET (activity_information / tag 0x50) events in the database")
 
     def f32(seq, cols):
         # keep rank 2 ([0, cols]) for empty series, matching the LibTorch mat() path;
@@ -164,7 +173,11 @@ def main():
 
     d = datetime.datetime.utcfromtimestamp(anchor_unix + args.tz * 3600)
     context = torch.tensor([d.year, d.month, d.day, d.weekday()], dtype=torch.float32)
-    user = torch.tensor([30, 1, 1.78, 78] + [float("nan")] * 10, dtype=torch.float32)
+    # 1.0 male, 0.0 female, 0.5 when unstated — the midpoint rather than a guess.
+    sex_code = {"M": 1.0, "F": 0.0}.get(args.sex, 0.5)
+    user = torch.tensor(
+        [args.age, sex_code, args.height, args.weight] + [float("nan")] * 10,
+        dtype=torch.float32)
 
     m = torch.jit.load(str(MODEL), map_location="cpu").eval()
     with torch.no_grad():
@@ -193,7 +206,7 @@ def main():
         })
 
     if args.json:
-        print(jsonlib.dumps({"model": MODEL_VERSION, "sessions": sessions}, indent=2))
+        emit_json({"model": MODEL_VERSION, "sessions": sessions})
         return
 
     print(f"Activity sessions — Oura automatic_activity_detection v{MODEL_VERSION} (the ring's own model)\n")
