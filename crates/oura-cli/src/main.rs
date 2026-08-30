@@ -654,9 +654,17 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
 
     let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
     let info = client.firmware().await.ok();
+    let hardware_id = client.hardware_id().await.ok();
 
     let store = Store::open(&cli.db)?;
-    store.upsert_device(&serial, None, info.as_ref())?;
+    store.upsert_device(&serial, hardware_id.as_deref(), info.as_ref())?;
+
+    // The link is already authenticated here, so record the battery level while we
+    // have it. Nothing else in the CLI ever calls `insert_battery`, so without this
+    // the readings table stays empty and offline consumers can never report battery.
+    if let Ok(battery) = client.battery().await {
+        let _ = store.insert_battery(&serial, &battery);
+    }
 
     let cursor = store.cursor(&serial)?;
     println!("Syncing events for {serial} from cursor {cursor} ...");
