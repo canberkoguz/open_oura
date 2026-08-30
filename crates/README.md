@@ -34,6 +34,22 @@ app-auth key, stored as hex in a file (one line). For a ring you factory-reset a
 re-key yourself, that file is written during pairing; for an already-onboarded ring
 the key lives in the official app's database. Pass it with `--key-file`.
 
+> **A ring still onboarded to the official app needs a one-time bond with your host.**
+> Until it is bonded, it advertises normally (so `scan` finds it at full signal) but
+> silently ignores every connection request — no timeout, no rejection, even with the
+> phone's Bluetooth off, and identically across BLE stacks. **Put the ring on its
+> charger to establish the bond:** charging is what makes it accept an unbonded
+> connection, at which point the OS raises its pairing prompt. Accept it. After that
+> the ring connects normally off the charger and the charger is no longer needed.
+>
+> Verified on a Ring 4 (`ORE_06`, fw 2.12.3): seven unbonded off-charger attempts
+> across `btleplug` and `bleak` all timed out; on-charger connected and triggered
+> macOS pairing; post-bond, off-charger connects succeed repeatedly.
+>
+> Note also that the auth key is *app-level* authentication, applied only after a
+> connection exists — it cannot substitute for the bond. Unauthenticated `info` works
+> without a key; battery, history events and live HR do not.
+
 ## Commands
 
 ```bash

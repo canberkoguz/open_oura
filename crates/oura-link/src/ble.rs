@@ -13,6 +13,11 @@ use crate::error::{Error, Result};
 use oura_protocol::protocol;
 use crate::transport::Transport;
 
+/// How long to wait for the ring to accept a BLE connection before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long to wait for GATT service discovery once connected.
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// A ring discovered while scanning.
 #[derive(Clone, Debug)]
 pub struct Discovered {
@@ -134,10 +139,29 @@ impl BleTransport {
         let _ = adapter.stop_scan().await;
 
         let (peripheral, _) = chosen.ok_or(Error::DeviceNotFound)?;
+        // CoreBluetooth's connect has no timeout of its own: a ring that never
+        // accepts the link would leave us awaiting forever. Bound both steps so the
+        // failure is reported instead of hanging.
         if !peripheral.is_connected().await? {
-            peripheral.connect().await?;
+            tokio::time::timeout(CONNECT_TIMEOUT, peripheral.connect())
+                .await
+                .map_err(|_| {
+                    Error::Ble(format!(
+                        "ring was advertising but did not accept a connection within \
+                         {}s (it may be connected to another central, bonded elsewhere, \
+                         or the host Bluetooth stack may need a restart)",
+                        CONNECT_TIMEOUT.as_secs()
+                    ))
+                })??;
         }
-        peripheral.discover_services().await?;
+        tokio::time::timeout(DISCOVER_TIMEOUT, peripheral.discover_services())
+            .await
+            .map_err(|_| {
+                Error::Ble(format!(
+                    "connected, but GATT service discovery stalled after {}s",
+                    DISCOVER_TIMEOUT.as_secs()
+                ))
+            })??;
 
         let chars = peripheral.characteristics();
         let write_char = chars

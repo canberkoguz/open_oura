@@ -53,3 +53,6 @@ notes/
 
 # mitmproxy-captured tokens (local only)
 tools/oura_tokens.txt
+profile.json
+oura.db.pre-reset-backup
+reverse/
