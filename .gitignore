@@ -54,5 +54,8 @@ notes/
 # mitmproxy-captured tokens (local only)
 tools/oura_tokens.txt
 profile.json
+# oura-dash's model result cache: holds a night's staged hypnogram, which is
+# personal sleep data.
+model_cache.json
 oura.db.pre-reset-backup
 reverse/
