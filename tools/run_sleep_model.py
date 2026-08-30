@@ -11,7 +11,7 @@ Usage: python tools/run_sleep_model.py [--start-ds N --end-ds N] [DB] [--tz H]
        (no window → uses the bedtime_period in the DB)
        legacy positional form START_DS END_DS [DB] [TZ] still works
 """
-import argparse, sys, json, sqlite3, datetime
+import argparse, sys, json, math, sqlite3, datetime
 from pathlib import Path
 import torch
 
@@ -102,6 +102,11 @@ if not beats or not any(b[3] == 1 for b in beats):
 
 def col(seq, i):
     return [r[i] for r in seq]
+
+def _finite(x):
+    """A rounded number, or None where the model had nothing to say."""
+    return round(x, 3) if math.isfinite(x) else None
+
 ibi_ts = torch.tensor(col(beats, 0), dtype=torch.int64)
 ibi_val = torch.tensor([[b[1], b[2], b[3]] for b in beats], dtype=torch.float32)
 acm_ts = torch.tensor(col(acm, 0), dtype=torch.int64)
@@ -147,6 +152,24 @@ if AS_JSON:
         },
         # Per-epoch stage ids, the model's own: 1=DEEP 2=LIGHT 3=REM 4=WAKE.
         "hypnogram": stages,
+        # The model returns more than a staging, and this runner used to drop
+        # it on the floor. Two unlabelled vectors come back beside the
+        # hypnogram; `run_models.py`'s bdi branch already emits its own pair
+        # the same way. Passed through verbatim and deliberately unnamed — the
+        # field meanings are not recovered, and a guessed name in the payload
+        # would be read downstream as a fact. Non-finite entries become null:
+        # several are NaN when SpO2 is not supplied, and JSON has no NaN.
+        "output_metrics": [_finite(x) for x in metrics.flatten().tolist()],
+        "debug_metrics": [_finite(x) for x in debug.flatten().tolist()],
+        # How sure the model was of each epoch's stage. Columns 1-4 of the
+        # staging tensor are the per-class probabilities — their argmax is the
+        # stage in column 0, on every epoch — so the winning one is the
+        # model's own confidence in the band it drew. Only the maximum is
+        # kept: all four columns would be four times the payload, for three
+        # numbers that are recoverable from the fourth only in aggregate and
+        # that nothing reads today.
+        "stage_confidence": [
+            round(p, 3) for p in staging[:, 1:].max(1).values.tolist()],
     })
     raise SystemExit(0)
 
