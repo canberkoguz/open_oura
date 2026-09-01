@@ -41,6 +41,26 @@ CREATE TABLE IF NOT EXISTS events (
     UNIQUE(serial, tag, ring_timestamp, body)
 );
 CREATE INDEX IF NOT EXISTS idx_events_serial_tag ON events(serial, tag);
+-- Serves the read side. A consumer charts a metric by selecting one device's
+-- events of a given name across a ring_timestamp range, and the index above
+-- cannot answer that: with a single device in the database its serial prefix
+-- matches every row, so the query degenerates to a full pass with a rowid
+-- lookup each, then a temp b-tree to sort. Measured on a 91,183-event
+-- database, nine metrics cost 492 ms of SQL without this index and 116 ms
+-- with it -- and, more to the point, the cost stops scaling with the table
+-- and starts scaling with the result: one metric returning 69 rows went from
+-- 44.9 ms to 0.1 ms.
+--
+-- It costs about 20% of the file (3.9 MB there) and roughly doubles the
+-- insert time per event, which is invisible against a sync that is BLE-bound.
+-- Because this schema is replayed with execute_batch on every store open and
+-- every statement is IF NOT EXISTS, adding the line is also what upgrades
+-- databases that already exist: they gain the index on the next open. Note
+-- that this reaches only readers that go through this crate -- a database
+-- written by something else (oura-dash's /ingest endpoint, which is Python
+-- and does not replay this schema) needs the index created out of band.
+CREATE INDEX IF NOT EXISTS idx_events_serial_name_ts
+    ON events(serial, name, ring_timestamp);
 
 CREATE TABLE IF NOT EXISTS readings (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
