@@ -1,0 +1,29 @@
+[package]
+name = "oura-ffi"
+description = "UniFFI boundary: a ring sync driven by a foreign-supplied BLE writer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `staticlib` for the iOS xcframework; `cdylib` so the generator can load the
+# library on the host to emit bindings; `lib` so tests and the bindgen binary
+# can link it normally.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[dependencies]
+oura-protocol = { path = "../oura-protocol" }
+# No default features: btleplug stays out of the iOS build entirely.
+oura-link = { path = "../oura-link", default-features = false }
+oura-store = { path = "../oura-store" }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
+async-trait = "0.1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+hex = "0.4"
+uniffi = { version = "0.32", features = ["cli"] }
+
+[dev-dependencies]
+tempfile = "3"

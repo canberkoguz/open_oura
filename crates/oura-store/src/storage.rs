@@ -60,6 +60,23 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// One stored event, as read back out for incremental upload.
+///
+/// `body` is the raw event payload exactly as the ring sent it; `decoded_json`
+/// is present only for tags the decoders understand at the time the row was
+/// written (or last re-decoded).
+#[derive(Clone, Debug)]
+pub struct EventRow {
+    pub id: i64,
+    pub serial: String,
+    pub tag: u8,
+    pub name: String,
+    pub ring_timestamp: i64,
+    pub body: Vec<u8>,
+    pub decoded_json: Option<String>,
+    pub captured_unix: i64,
+}
+
 /// A SQLite-backed store for ring data.
 pub struct Store {
     conn: Connection,
@@ -229,6 +246,46 @@ impl Store {
         Ok(rows)
     }
 
+    /// Events with `id` greater than `after_id`, oldest first, at most `limit`
+    /// rows. `limit` of 0 returns nothing rather than everything.
+    ///
+    /// The monotonic `id` is what makes incremental upload possible without a
+    /// second writer: a consumer keeps the highest `id` it has accepted and
+    /// asks for what came after. No `uploaded` column, no schema change, and
+    /// the dashboard's read-only view of this file stays read-only.
+    pub fn events_since(&self, after_id: i64, limit: u32) -> Result<Vec<EventRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, serial, tag, name, ring_timestamp, body, decoded_json, captured_unix \
+             FROM events WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![after_id, limit as i64], |r| {
+                Ok(EventRow {
+                    id: r.get(0)?,
+                    serial: r.get(1)?,
+                    tag: r.get::<_, i64>(2)? as u8,
+                    name: r.get(3)?,
+                    ring_timestamp: r.get(4)?,
+                    body: r.get(5)?,
+                    decoded_json: r.get(6)?,
+                    captured_unix: r.get(7)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// The highest event `id` in the store, or 0 when there are none. Lets a
+    /// caller report how far an upload would have to reach without pulling the
+    /// rows themselves.
+    pub fn max_event_id(&self) -> Result<i64> {
+        // COALESCE, not `.optional()`: MAX over an empty table returns one row
+        // holding NULL rather than no rows at all.
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?)
+    }
+
     /// Distinct device serials that have stored events.
     pub fn device_serials(&self) -> Result<Vec<String>> {
         let mut stmt = self
@@ -274,5 +331,54 @@ mod tests {
 
         let counts = store.event_counts("S1").unwrap();
         assert_eq!(counts, vec![("debug_event".to_string(), 1)]);
+    }
+
+    #[test]
+    fn events_since_pages_forward_without_gaps_or_repeats() {
+        let store = Store::open_in_memory().unwrap();
+        for ts in 0..10u32 {
+            store
+                .insert_event(
+                    "S1",
+                    &RingEvent {
+                        tag: 0x43,
+                        name: "debug_event",
+                        timestamp: ts,
+                        body: vec![ts as u8],
+                        decoded: None,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Walk the whole table the way an uploader does: keep the last id seen
+        // and ask for what came after. Every row exactly once, in order.
+        let mut seen = Vec::new();
+        let mut after = 0i64;
+        loop {
+            let page = store.events_since(after, 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().unwrap().id;
+            seen.extend(page.iter().map(|r| r.ring_timestamp));
+        }
+        assert_eq!(seen, (0..10).collect::<Vec<i64>>());
+        assert_eq!(store.max_event_id().unwrap(), after);
+
+        // A limit of 0 must mean nothing, not everything -- SQLite's LIMIT 0
+        // returns no rows, and an uploader that passed 0 by accident should
+        // stall rather than pull the entire history.
+        assert!(store.events_since(0, 0).unwrap().is_empty());
+        // Past the end is empty, not an error.
+        assert!(store.events_since(after, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn max_event_id_is_zero_on_an_empty_store() {
+        // The uploader's high-water mark starts at 0, so an empty store must
+        // not report something that would skip the first real row.
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.max_event_id().unwrap(), 0);
     }
 }

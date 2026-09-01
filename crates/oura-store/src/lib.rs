@@ -4,4 +4,4 @@ pub mod error;
 pub mod storage;
 
 pub use error::{Error, Result};
-pub use storage::Store;
+pub use storage::{EventRow, Store};
