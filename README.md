@@ -100,6 +100,8 @@ State-changing and destructive commands are hidden behind `--include-state` and
 - [`docs/native-decoder.md`](docs/native-decoder.md): porting event-body decoders
   from the native `libringeventparser.so` (how the byte layouts were recovered with
   Ghidra).
+- [`docs/ios-build.md`](docs/ios-build.md): cross-compiling the protocol/analysis/store
+  crates to iOS (device + simulator), and the SQLite deployment-target gotcha.
 
 ## Safety and secrets
 
