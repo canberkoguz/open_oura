@@ -28,8 +28,29 @@ pub struct Discovered {
 
 /// A connected BLE link to a ring. Notifications from every notify/indicate
 /// characteristic in the Oura service are merged into one broadcast stream, which
-/// keeps the client working across ring generations that expose extra
-/// characteristics (Ring 5 adds `…0004/0005/0006`).
+/// is what keeps the client working across ring generations without ever having
+/// to name the extra characteristics individually.
+///
+/// `…0004/0005/0006` are **not** a Ring 5 addition. `docs/ring-5-observations.md`
+/// records them as first-contact Ring 5 findings, which is where the earlier
+/// wording here came from, but first seen on a Ring 5 is not the same as absent
+/// from a Ring 4. A Ring 4 exposes all three — enumerated from real hardware on
+/// 2026-09-01:
+///
+/// | characteristic | properties |
+/// | -- | -- |
+/// | `98ED0002` | write, write-no-rsp |
+/// | `98ED0003` | read, notify |
+/// | `98ED0004` | read, write, write-no-rsp, notify, indicate |
+/// | `98ED0005` | write-no-rsp, notify |
+/// | `98ED0006` | write-no-rsp, notify |
+///
+/// The merge above is why none of that changes the code: the generation question
+/// never arises here. This note exists because the previous wording was read
+/// elsewhere as a statement about what a Ring 4 lacks, and transcribed into
+/// another codebase on that basis. Worth recording too that `98ED0004` is the
+/// richest characteristic the ring offers — the only one carrying **indicate**,
+/// and the only one with read, write and notify together.
 pub struct BleTransport {
     peripheral: Peripheral,
     write_char: Characteristic,
