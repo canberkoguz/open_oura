@@ -149,12 +149,15 @@ impl RingWriter for FakeRing {
 /// Records what the progress callback saw.
 #[derive(Default)]
 struct RecordingProgress {
-    calls: Mutex<Vec<(u32, u32)>>,
+    calls: Mutex<Vec<(u32, u32, u32)>>,
 }
 
 impl SyncProgress for RecordingProgress {
-    fn batch_done(&self, events_so_far: u32, cursor: u32) {
-        self.calls.lock().unwrap().push((events_so_far, cursor));
+    fn batch_done(&self, events_so_far: u32, cursor: u32, bytes_left: u32) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((events_so_far, cursor, bytes_left));
     }
 }
 
@@ -320,8 +323,10 @@ fn progress_reports_events_pulled_after_every_batch() {
 
     let calls = progress.calls.lock().unwrap().clone();
     assert_eq!(calls.len(), 3, "one per drained batch: {calls:?}");
-    // Monotonic in both axes, and the last one matches the final report.
-    assert_eq!(calls, vec![(10, 91), (20, 191), (25, 241)]);
+    // Events pulled and the cursor climb; the backlog the ring still holds
+    // falls to zero on the batch that drains it. `FakeRing` reports ten bytes
+    // per undelivered event, so 15 and 5 events left read as 150 and 50.
+    assert_eq!(calls, vec![(10, 91, 150), (20, 191, 50), (25, 241, 0)]);
 }
 
 // --- interruption -------------------------------------------------------

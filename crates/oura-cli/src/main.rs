@@ -693,7 +693,7 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
             // Persist the cursor after each fully-drained batch (so an interrupted
             // sync still makes progress) — but not once a DB write has failed. A
             // failed cursor write is itself recorded so it can't be silently lost.
-            |c| {
+            |c, _bytes_left| {
                 if db_err.borrow().is_some() {
                     return;
                 }

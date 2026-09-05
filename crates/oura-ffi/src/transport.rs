@@ -59,9 +59,17 @@ pub trait RingWriter: Send + Sync {
 /// Runs on the sync thread. It must not block and must not call back into the
 /// session — `run_sync` holds the store lock for its whole duration, so a
 /// re-entrant call would deadlock rather than return an error.
+///
+/// `bytes_left` is the ring's own count of the backlog still queued behind this
+/// batch, and reaches zero on the batch that drains it. It is what a determinate
+/// progress bar needs: `events_so_far` only ever climbs, and `cursor` is a
+/// position on the ring's clock whose end is not known in advance. Note that the
+/// first call already reports the backlog *after* one batch — there is no reading
+/// to be had before the ring has answered once — so a bar scaled to it starts
+/// just above zero rather than at it.
 #[uniffi::export(with_foreign)]
 pub trait SyncProgress: Send + Sync {
-    fn batch_done(&self, events_so_far: u32, cursor: u32);
+    fn batch_done(&self, events_so_far: u32, cursor: u32, bytes_left: u32);
 }
 
 struct Inner {

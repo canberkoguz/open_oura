@@ -221,11 +221,17 @@ impl<T: Transport> OuraClient<T> {
     /// `on_event` for each. Loops until the ring reports no bytes left. Returns
     /// the count synced and the next cursor to persist for incremental sync.
     ///
-    /// `on_batch` is called with the advanced cursor after every fully-processed
-    /// batch, so callers can persist it incrementally — otherwise an interrupted
-    /// sync (timeout / BLE drop) inserts events but loses the cursor advance,
-    /// forcing the next sync to re-pull from the old cursor (and never reach new
-    /// events if a batch cap is hit first).
+    /// `on_batch` is called with the advanced cursor and the ring's own
+    /// `bytes_left` after every fully-processed batch, so callers can persist the
+    /// cursor incrementally — otherwise an interrupted sync (timeout / BLE drop)
+    /// inserts events but loses the cursor advance, forcing the next sync to
+    /// re-pull from the old cursor (and never reach new events if a batch cap is
+    /// hit first).
+    ///
+    /// `bytes_left` is the backlog the ring says it still holds. It is the only
+    /// number in the whole drain that is a *total* rather than a running count,
+    /// which makes it the one thing a determinate progress bar can be built on;
+    /// the cursor cannot, being a position on a clock with no known end.
     pub async fn drain_events<F, G>(
         &self,
         cursor: u32,
@@ -234,7 +240,7 @@ impl<T: Transport> OuraClient<T> {
     ) -> Result<SyncOutcome>
     where
         F: FnMut(&RingEvent),
-        G: FnMut(u32),
+        G: FnMut(u32, u32),
     {
         let mut start = cursor;
         let mut total = 0u32;
@@ -265,7 +271,9 @@ impl<T: Transport> OuraClient<T> {
             let progressed = batch_events > 0 && next > start;
             if progressed {
                 start = next;
-                on_batch(start); // persist incrementally (this batch is fully drained)
+                // Persist incrementally (this batch is fully drained), and hand
+                // over what the ring says is still queued behind it.
+                on_batch(start, bytes_left);
             }
             // Stop when drained, or when we can make no further progress.
             if bytes_left == 0 || !progressed {

@@ -283,7 +283,7 @@ impl RingSession {
                         Err(e) => *db_err.borrow_mut() = Some(e),
                     }
                 },
-                |c| {
+                |c, bytes_left| {
                     if db_err.borrow().is_some() {
                         return;
                     }
@@ -295,7 +295,7 @@ impl RingSession {
                         // Events pulled, not rows added: a resumed sync
                         // re-reads an overlapping range and would otherwise
                         // look stalled while it worked through it.
-                        p.batch_done(seen.get(), c);
+                        p.batch_done(seen.get(), c, bytes_left);
                     }
                 },
             )
