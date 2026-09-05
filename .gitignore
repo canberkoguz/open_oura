@@ -7,9 +7,15 @@ __pycache__/
 /target/
 
 # Local SQLite databases may contain device serials and personal ring data.
+# The WAL sidecars hold rows not yet folded back into the .db file, so they are
+# the same data and are covered by the same reasoning, not merely noise.
 *.db
 *.db-journal
+*.db-shm
+*.db-wal
 *.sqlite
+*.sqlite-shm
+*.sqlite-wal
 
 # Local BLE captures may include serials, MAC-derived identifiers, or auth data.
 captures/
