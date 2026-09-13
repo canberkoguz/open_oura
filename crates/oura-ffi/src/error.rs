@@ -2,7 +2,8 @@
 //!
 //! Every variant is one the Swift side can act on differently: `Disconnected`
 //! means retry when the ring is back, `Auth` means the stored key is wrong and
-//! retrying will never help, `Cancelled` means the user asked and nothing is
+//! retrying will never help, `NoResponse` means the ring never answered (so the
+//! key is untested, not wrong), `Cancelled` means the user asked and nothing is
 //! broken.
 
 /// An error crossing the FFI boundary. Surfaces in Swift as a thrown error.
@@ -35,6 +36,14 @@ pub enum FfiError {
     /// The auth key was not exactly 16 bytes.
     #[error("auth key must be 16 bytes, got {got}")]
     BadKeyLength { got: u32 },
+    /// A request drew no reply within the quiet window: the write never reached
+    /// the ring (e.g. issued before the link was up) or the reply never reached
+    /// us. Not a verdict on the key, so worth retrying.
+    //
+    // Last on purpose: UniFFI encodes variants by index, so appending keeps
+    // every existing variant's wire value unchanged.
+    #[error("no response: {message}")]
+    NoResponse { message: String },
 }
 
 impl From<oura_link::Error> for FfiError {
@@ -43,6 +52,7 @@ impl From<oura_link::Error> for FfiError {
         match e {
             L::Auth(message) => FfiError::Auth { message },
             L::Protocol(message) => FfiError::Protocol { message },
+            L::NoResponse(message) => FfiError::NoResponse { message },
             // Ble, DeviceNotFound, CharacteristicNotFound and Io all describe a
             // link that is not carrying frames, which is one situation to the
             // caller even though the crate distinguishes them.

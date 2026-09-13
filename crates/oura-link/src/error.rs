@@ -15,6 +15,11 @@ pub enum Error {
     Auth(String),
     #[error("protocol error: {0}")]
     Protocol(String),
+    /// Nothing came back within the quiet window: the request never reached
+    /// the ring, or its reply never reached us. A link problem, not a verdict
+    /// from the ring, so it says nothing about the key.
+    #[error("no response from the ring to the {0}")]
+    NoResponse(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

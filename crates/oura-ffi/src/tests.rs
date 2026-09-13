@@ -384,6 +384,18 @@ fn a_rejected_key_is_an_auth_error_not_a_bluetooth_one() {
 }
 
 #[test]
+fn a_ring_that_never_answers_auth_is_no_response_not_a_rejected_key() {
+    // What a write issued before the link is up looks like from here. Reported
+    // as `Auth` it would stop the app retrying for a problem that clears itself.
+    let mut ring = FakeRing::new(sample_events(1), 10);
+    Arc::get_mut(&mut ring).unwrap().go_silent_after = Some(0);
+    let (session, _dir) = session_with(ring.clone());
+
+    let err = session.run_sync(KEY.to_vec(), false, None).unwrap_err();
+    assert!(matches!(err, FfiError::NoResponse { .. }), "got {err:?}");
+}
+
+#[test]
 fn a_short_key_is_rejected_before_anything_is_written_to_the_ring() {
     let ring = FakeRing::new(sample_events(1), 10);
     let (session, _dir) = session_with(ring.clone());

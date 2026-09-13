@@ -115,6 +115,16 @@ impl<T: Transport> OuraClient<T> {
         packets.iter().find(|p| p.tag == tag)
     }
 
+    /// The error for a reply that lacks the frame we wanted: silence is a link
+    /// failure, anything else is the ring saying something we did not expect.
+    fn missing(packets: &[Packet], request: &str) -> Error {
+        if packets.is_empty() {
+            Error::NoResponse(format!("{request} request"))
+        } else {
+            Error::Protocol(format!("unexpected reply to the {request} request"))
+        }
+    }
+
     // --- device info -------------------------------------------------------
 
     /// Read firmware/version metadata (no auth required).
@@ -165,13 +175,18 @@ impl<T: Transport> OuraClient<T> {
 
     /// Run the app-auth challenge with a 16-byte key. Must be repeated per
     /// connection on rings that have a key installed.
+    ///
+    /// Only a received, non-success `0x2e` state is [`Error::Auth`]. A silent
+    /// ring is [`Error::NoResponse`] and an unexpected reply is
+    /// [`Error::Protocol`]: neither says anything about the key, and callers
+    /// treat `Auth` as "retrying will never help".
     pub async fn authenticate(&self, key: &[u8; 16]) -> Result<AuthResult> {
         let packets = self.request(&protocol::req_auth_nonce()).await?;
         let nonce = packets
             .iter()
             .find(|p| p.ext_tag() == Some(0x2c))
             .map(|p| p.payload[1..].to_vec())
-            .ok_or_else(|| Error::Auth("no nonce response".into()))?;
+            .ok_or_else(|| Self::missing(&packets, "nonce"))?;
 
         let encrypted = encrypt_nonce(key, &nonce);
         let packets = self.request(&protocol::req_authenticate(&encrypted)).await?;
@@ -179,7 +194,7 @@ impl<T: Transport> OuraClient<T> {
             .iter()
             .find(|p| p.ext_tag() == Some(0x2e))
             .and_then(|p| p.payload.get(1).copied())
-            .ok_or_else(|| Error::Auth("no authenticate response".into()))?;
+            .ok_or_else(|| Self::missing(&packets, "authenticate"))?;
 
         let result = AuthResult::from(state);
         if result.is_success() {
@@ -622,6 +637,51 @@ mod tests {
             .try_into()
             .unwrap();
         assert_eq!(client.authenticate(&key).await.unwrap(), AuthResult::Success);
+    }
+
+    const AUTH_KEY: &str = "4431967d8bacc2659743142b68391d9a";
+    const NONCE_REQUEST: &str = "2f012b";
+    const NONCE_REPLY: &str = "2f102c0e2d6a0a08c99b4365f458e6e97382";
+    const AUTHENTICATE_REQUEST: &str = "2f112da38a8772d3acb6db5c2b516dd56987c8";
+
+    async fn authenticate_against(mock: MockTransport) -> Result<AuthResult> {
+        let client = OuraClient::new(mock).with_quiet(Duration::from_millis(20));
+        let key: [u8; 16] = hex::decode(AUTH_KEY).unwrap().try_into().unwrap();
+        client.authenticate(&key).await
+    }
+
+    #[tokio::test]
+    async fn silent_nonce_request_is_no_response_not_auth() {
+        // A write dropped before the link was up looks exactly like this, and
+        // it must not read as a rejected key.
+        let err = authenticate_against(MockTransport::new()).await.unwrap_err();
+        assert!(matches!(err, Error::NoResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn silent_authenticate_request_is_no_response_not_auth() {
+        let mock = MockTransport::new();
+        mock.on(NONCE_REQUEST, &[NONCE_REPLY]);
+        let err = authenticate_against(mock).await.unwrap_err();
+        assert!(matches!(err, Error::NoResponse(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn unexpected_nonce_reply_is_protocol_not_auth() {
+        let mock = MockTransport::new();
+        mock.on(NONCE_REQUEST, &["2f022e00"]);
+        let err = authenticate_against(mock).await.unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn explicit_auth_failure_is_auth() {
+        let mock = MockTransport::new();
+        mock.on(NONCE_REQUEST, &[NONCE_REPLY]);
+        // 0x03 = NotOriginalOnboardedDevice.
+        mock.on(AUTHENTICATE_REQUEST, &["2f022e03"]);
+        let err = authenticate_against(mock).await.unwrap_err();
+        assert!(matches!(err, Error::Auth(_)), "got {err:?}");
     }
 
     #[test]
