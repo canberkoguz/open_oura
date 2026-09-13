@@ -39,6 +39,9 @@ struct FakeRing {
     /// Invoked before answering, so a test can cancel from "another thread".
     on_request: Mutex<Option<Box<dyn Fn(&RingSession, usize) + Send>>>,
     auth_state: u8,
+    /// The `0x29` status this ring answers a sleep-analysis check with. `None`
+    /// stands in for a ring that does not answer the check at all.
+    sleep_analysis_status: Option<u8>,
 }
 
 impl FakeRing {
@@ -51,7 +54,15 @@ impl FakeRing {
             go_silent_after: None,
             on_request: Mutex::new(None),
             auth_state: 0x00, // success
+            sleep_analysis_status: Some(0x00), // success
         })
+    }
+
+    /// The same ring, but one that never answers the sleep-analysis check.
+    fn mute_about_sleep_analysis(events: Vec<(u32, u8, Vec<u8>)>, batch: usize) -> Arc<Self> {
+        let mut ring = Arc::into_inner(Self::new(events, batch)).unwrap();
+        ring.sleep_analysis_status = None;
+        Arc::new(ring)
     }
 
     fn request_count(&self) -> usize {
@@ -76,6 +87,12 @@ impl FakeRing {
             // Capabilities: this ring declines to answer, which must not be
             // fatal -- `run_sync` reads them for handshake order, not content.
             0x2f if payload.first() == Some(&0x01) => vec![],
+
+            // --- sleep analysis ---
+            0x28 => self
+                .sleep_analysis_status
+                .map(|s| vec![Packet::new(0x29, vec![s]).encode()])
+                .unwrap_or_default(),
 
             // --- metadata ---
             0x08 => vec![hex::decode("091202000003040301000105000cffeeddccbbaa").unwrap()],
@@ -223,7 +240,7 @@ fn current_thread_runtime_wakes_on_a_cross_thread_send() {
 
 fn run(ring: &Arc<FakeRing>, session: &Arc<RingSession>) -> Result<SyncReport, FfiError> {
     let _ = ring;
-    session.run_sync(KEY.to_vec(), false, None)
+    session.run_sync(KEY.to_vec(), false, false, None)
 }
 
 #[test]
@@ -277,7 +294,7 @@ fn sync_time_is_the_callers_choice_not_a_hidden_write() {
     for (want, expected) in [(false, 0usize), (true, 1)] {
         let ring = FakeRing::new(sample_events(1), 10);
         let (session, _dir) = session_with(ring.clone());
-        session.run_sync(KEY.to_vec(), want, None).unwrap();
+        session.run_sync(KEY.to_vec(), want, false, None).unwrap();
         let n = ring
             .requests
             .lock()
@@ -287,6 +304,80 @@ fn sync_time_is_the_callers_choice_not_a_hidden_write() {
             .count();
         assert_eq!(n, expected, "sync_time={want}");
     }
+}
+
+#[test]
+fn forcing_sleep_analysis_is_the_callers_choice_not_a_hidden_write() {
+    // Same reasoning as `sync_time` above: asking the ring to run sleep
+    // analysis is a state change on the ring, so it happens when asked and
+    // never when not.
+    for (want, expected) in [(false, 0usize), (true, 1)] {
+        let ring = FakeRing::new(sample_events(1), 10);
+        let (session, _dir) = session_with(ring.clone());
+        session.run_sync(KEY.to_vec(), false, want, None).unwrap();
+        let forced: Vec<Vec<u8>> = ring
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f[0] == 0x28)
+            .cloned()
+            .collect();
+        assert_eq!(forced.len(), expected, "force_sleep_analysis={want}");
+        if want {
+            // The force flag, not the plain check the drain loop would send.
+            assert_eq!(forced[0], vec![0x28, 0x01, 0x01]);
+        }
+    }
+}
+
+#[test]
+fn the_forced_check_goes_out_after_auth_and_before_the_drain() {
+    // After auth because the ring rejects it otherwise, and before the drain
+    // because that is where the stock app puts its own `0x28` -- and because
+    // it buys the analysis the length of the drain to get somewhere.
+    let ring = FakeRing::new(sample_events(3), 10);
+    let (session, _dir) = session_with(ring.clone());
+    session.run_sync(KEY.to_vec(), false, true, None).unwrap();
+
+    let reqs = ring.requests.lock().unwrap();
+    let forced = reqs.iter().position(|f| f[0] == 0x28).expect("no 0x28 sent");
+    let authenticated = reqs
+        .iter()
+        .position(|f| f[0] == 0x2f && f.get(2) == Some(&0x2d))
+        .expect("no authenticate sent");
+    let first_drain = reqs.iter().position(|f| f[0] == 0x10).expect("no GetEvent");
+
+    assert!(forced > authenticated, "forced the check before authenticating");
+    assert!(forced < first_drain, "forced the check after the drain");
+}
+
+#[test]
+fn a_forced_check_reports_the_rings_status() {
+    // The status is the only evidence the phone can show that the ring took
+    // the request, so it has to survive the trip back.
+    let ring = FakeRing::new(sample_events(1), 10);
+    let (session, _dir) = session_with(ring.clone());
+
+    let asked = session.run_sync(KEY.to_vec(), false, true, None).unwrap();
+    assert_eq!(asked.sleep_analysis_status, Some(0));
+
+    let not_asked = session.run_sync(KEY.to_vec(), false, false, None).unwrap();
+    assert_eq!(not_asked.sleep_analysis_status, None, "reported without asking");
+}
+
+#[test]
+fn a_ring_that_will_not_answer_the_check_still_syncs() {
+    // The forced check is an optimisation on top of a sync that works without
+    // it. A ring that ignores it, or answers something we cannot read, must
+    // cost us the analysis and nothing else.
+    let ring = FakeRing::mute_about_sleep_analysis(sample_events(5), 10);
+    let (session, _dir) = session_with(ring.clone());
+
+    let report = session.run_sync(KEY.to_vec(), false, true, None).unwrap();
+
+    assert_eq!(report.rows_inserted, 5, "the drain did not survive the check");
+    assert_eq!(report.sleep_analysis_status, None);
 }
 
 #[test]
@@ -303,7 +394,7 @@ fn resyncing_is_idempotent_and_resumes_from_the_cursor() {
     let db = dir.path().join("ring.db");
     let session2 = RingSession::open(ring2.clone(), db.to_str().unwrap(), TEST_QUIET).unwrap();
     *ring2.session.lock().unwrap() = Arc::downgrade(&session2);
-    let second = session2.run_sync(KEY.to_vec(), false, None).unwrap();
+    let second = session2.run_sync(KEY.to_vec(), false, false, None).unwrap();
 
     assert_eq!(second.events_received, 0);
     assert_eq!(second.rows_inserted, 0);
@@ -318,7 +409,7 @@ fn progress_reports_events_pulled_after_every_batch() {
     let progress = Arc::new(RecordingProgress::default());
 
     session
-        .run_sync(KEY.to_vec(), false, Some(progress.clone()))
+        .run_sync(KEY.to_vec(), false, false, Some(progress.clone()))
         .unwrap();
 
     let calls = progress.calls.lock().unwrap().clone();
@@ -343,7 +434,7 @@ fn cancel_stops_the_drain_and_keeps_what_was_stored() {
         }
     }));
 
-    let err = session.run_sync(KEY.to_vec(), false, None).unwrap_err();
+    let err = session.run_sync(KEY.to_vec(), false, false, None).unwrap_err();
     assert!(matches!(err, FfiError::Cancelled), "got {err:?}");
 
     // Cancelling is not a rollback: the batches that completed are durable and
@@ -367,7 +458,7 @@ fn a_ring_that_goes_silent_reports_disconnected_not_a_generic_failure() {
         }
     }));
 
-    let err = session.run_sync(KEY.to_vec(), false, None).unwrap_err();
+    let err = session.run_sync(KEY.to_vec(), false, false, None).unwrap_err();
     assert!(matches!(err, FfiError::Disconnected), "got {err:?}");
 }
 
@@ -379,7 +470,7 @@ fn a_rejected_key_is_an_auth_error_not_a_bluetooth_one() {
     Arc::get_mut(&mut ring).unwrap().auth_state = 0x03; // NotOriginalOnboardedDevice
     let (session, _dir) = session_with(ring.clone());
 
-    let err = session.run_sync(KEY.to_vec(), false, None).unwrap_err();
+    let err = session.run_sync(KEY.to_vec(), false, false, None).unwrap_err();
     assert!(matches!(err, FfiError::Auth { .. }), "got {err:?}");
 }
 
@@ -391,7 +482,7 @@ fn a_ring_that_never_answers_auth_is_no_response_not_a_rejected_key() {
     Arc::get_mut(&mut ring).unwrap().go_silent_after = Some(0);
     let (session, _dir) = session_with(ring.clone());
 
-    let err = session.run_sync(KEY.to_vec(), false, None).unwrap_err();
+    let err = session.run_sync(KEY.to_vec(), false, false, None).unwrap_err();
     assert!(matches!(err, FfiError::NoResponse { .. }), "got {err:?}");
 }
 
@@ -400,7 +491,7 @@ fn a_short_key_is_rejected_before_anything_is_written_to_the_ring() {
     let ring = FakeRing::new(sample_events(1), 10);
     let (session, _dir) = session_with(ring.clone());
 
-    let err = session.run_sync(vec![0u8; 8], false, None).unwrap_err();
+    let err = session.run_sync(vec![0u8; 8], false, false, None).unwrap_err();
     assert!(matches!(err, FfiError::BadKeyLength { got: 8 }), "got {err:?}");
     assert_eq!(ring.request_count(), 0, "must not touch the ring");
 }
@@ -423,14 +514,14 @@ fn a_second_concurrent_sync_is_refused_rather_than_interleaved() {
             let s2 = s2.clone();
             let out = out.clone();
             std::thread::spawn(move || {
-                *out.lock().unwrap() = Some(s2.run_sync(KEY.to_vec(), false, None));
+                *out.lock().unwrap() = Some(s2.run_sync(KEY.to_vec(), false, false, None));
             })
             .join()
             .unwrap();
         }
     }));
 
-    session.run_sync(KEY.to_vec(), false, None).unwrap();
+    session.run_sync(KEY.to_vec(), false, false, None).unwrap();
     let second = second_result.lock().unwrap().take().expect("second sync ran");
     assert!(matches!(second, Err(FfiError::Busy)), "got {second:?}");
 }

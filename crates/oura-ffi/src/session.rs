@@ -27,6 +27,11 @@ pub struct SyncReport {
     pub next_cursor: u32,
     /// The highest event id in the store, for the uploader's high-water mark.
     pub max_event_id: i64,
+    /// The ring's `0x29` answer to a forced sleep-analysis check, where one was
+    /// asked for and given: `0` is "ok". `None` means it was not asked for, or
+    /// the ring did not answer — the sync succeeds either way, so the caller
+    /// cannot read this as failure.
+    pub sleep_analysis_status: Option<u8>,
 }
 
 /// A ring conversation: one database, one foreign writer, one sync at a time.
@@ -156,6 +161,14 @@ impl RingSession {
     /// this on every connect, but it is a state change, so it is the caller's
     /// choice rather than a hidden effect.
     ///
+    /// `force_sleep_analysis` asks the ring to close out a finished sleep
+    /// period now instead of on its own schedule, which is hours late — see the
+    /// step in `drain`. A state change on the ring and an expensive one, so it
+    /// is the caller's choice for the same reason `sync_time` is, and the
+    /// caller is expected to rate-limit it rather than set it on every sync.
+    /// The ring's answer comes back as [`SyncReport::sleep_analysis_status`];
+    /// a refusal is never an error.
+    ///
     /// The ordering here is the one the Android app uses
     /// (`docs/sync-orchestration.md`) and is load-bearing, which is why this is
     /// one call rather than nine: the ordering belongs to the crate that knows
@@ -164,6 +177,7 @@ impl RingSession {
         &self,
         auth_key: Vec<u8>,
         sync_time: bool,
+        force_sleep_analysis: bool,
         progress: Option<Arc<dyn SyncProgress>>,
     ) -> Result<SyncReport, FfiError> {
         let got = auth_key.len();
@@ -180,7 +194,8 @@ impl RingSession {
             message: "the store lock was poisoned by an earlier panic".into(),
         })?;
 
-        let outcome = self.rt.block_on(self.drain(&store, &key, sync_time, progress));
+        let outcome = self.rt.block_on(self.drain(
+            &store, &key, sync_time, force_sleep_analysis, progress));
 
         // A stop reason outranks the link error it produced: `write` can only
         // report "ble error", and the caller wants to know whether to retry.
@@ -221,6 +236,7 @@ impl RingSession {
         store: &Store,
         key: &[u8; 16],
         sync_time: bool,
+        force_sleep_analysis: bool,
         progress: Option<Arc<dyn SyncProgress>>,
     ) -> Result<SyncReport, FfiError> {
         // 1-2. AUTHENTICATE. `oura-link` exposes one auth primitive -- the
@@ -259,6 +275,27 @@ impl RingSession {
         if let Some(b) = &battery {
             let _ = store.insert_battery(&serial, b);
         }
+
+        // 8. Ask the ring to close out a finished sleep period *now*.
+        //
+        //    Left alone the ring emits `bedtime_period` 3.5-4.0 h after a night
+        //    ends (and a flat 5 h 01 m after a nap), so the newest night is
+        //    inference on the dashboard for most of the morning. `0x28` with
+        //    the force flag is the documented way to ask for it early.
+        //
+        //    Here, rather than after the drain, for two reasons: an unforced
+        //    `0x28` is exactly what the app sends in this position, and the
+        //    analysis then has the whole drain to get somewhere before the
+        //    batch that might carry its result.
+        //
+        //    Never fatal. This is an optimisation on top of a sync that works
+        //    without it, so a ring that declines the check, or answers
+        //    something we cannot read, costs the analysis and nothing else.
+        let sleep_analysis_status = if force_sleep_analysis {
+            self.client.check_sleep_analysis(true).await.ok()
+        } else {
+            None
+        };
 
         // 9. SYNC_EVENTS.
         let cursor = store.cursor(&serial)?;
@@ -325,6 +362,7 @@ impl RingSession {
             rows_inserted: inserted.get(),
             next_cursor: outcome.next_cursor,
             max_event_id: store.max_event_id()?,
+            sleep_analysis_status,
         })
     }
 }
