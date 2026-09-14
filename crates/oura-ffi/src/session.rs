@@ -219,6 +219,26 @@ impl RingSession {
         upload::encode(&store.events_since(after_id, limit)?)
     }
 
+    /// How long sleep has been over, in ring-clock deciseconds, as of the last
+    /// drain. `None` when the store holds no sleep at all.
+    ///
+    /// Here so the caller can tell "the night is over" from "it is a certain
+    /// hour" before deciding whether to spend a forced sleep-analysis check on
+    /// this sync. Answers from storage, so it costs no link and no round trip,
+    /// and is therefore safe to ask before every sync. See
+    /// `Store::sleep_gap_ds` for why the figure needs no clock offset.
+    ///
+    /// Blocks until any running sync finishes, like the other reads here.
+    pub fn sleep_gap_ds(&self) -> Result<Option<u32>, FfiError> {
+        let store = self.store.lock().map_err(|_| FfiError::Storage {
+            message: "the store lock was poisoned by an earlier panic".into(),
+        })?;
+        let Some(serial) = store.device_serials()?.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(store.sleep_gap_ds(&serial)?)
+    }
+
     /// The highest event id in the store — what an uploader compares its
     /// high-water mark against to know whether anything is pending.
     pub fn max_event_id(&self) -> Result<i64, FfiError> {

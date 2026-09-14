@@ -381,6 +381,25 @@ fn a_ring_that_will_not_answer_the_check_still_syncs() {
 }
 
 #[test]
+fn sleep_gap_answers_from_the_last_drain_without_a_sync() {
+    // The phone asks this *before* deciding whether to force a check, so it has
+    // to answer off what is already stored rather than needing a live link.
+    let mut events = sample_events(3);
+    // A night that ended at 1_000, then two hours of awake events on top.
+    events.push((1_000, 0x72, vec![0x01])); // sleep_acm_period
+    events.push((73_000, 0x6f, vec![0x02])); // spo2_event
+    let ring = FakeRing::new(events, 100);
+    let (session, _dir) = session_with(ring.clone());
+
+    // Nothing stored yet: unknown, not "awake forever".
+    assert_eq!(session.sleep_gap_ds().unwrap(), None);
+
+    run(&ring, &session).unwrap();
+
+    assert_eq!(session.sleep_gap_ds().unwrap(), Some(72_000));
+}
+
+#[test]
 fn resyncing_is_idempotent_and_resumes_from_the_cursor() {
     let ring = FakeRing::new(sample_events(12), 5);
     let (session, dir) = session_with(ring.clone());

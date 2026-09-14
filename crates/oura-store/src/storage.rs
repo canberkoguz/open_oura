@@ -306,6 +306,38 @@ impl Store {
             .query_row("SELECT COALESCE(MAX(id), 0) FROM events", [], |r| r.get(0))?)
     }
 
+    /// How long sleep has been over, in ring-clock deciseconds: the distance
+    /// from the newest sleep epoch to the newest event of any kind.
+    ///
+    /// A wake detector that costs one indexed lookup. The ring emits
+    /// `sleep_acm_period` once per 30 s epoch while asleep and stops on waking,
+    /// while every other stream keeps going — so the gap between them is time
+    /// spent awake. Both ends are ring timestamps, so the answer needs no clock
+    /// offset, which is what lets the phone ask it *before* a sync, against
+    /// whatever the last drain left behind.
+    ///
+    /// `None` when the ring has recorded no sleep at all. That is not "awake
+    /// for a long time" and must not be read as one.
+    pub fn sleep_gap_ds(&self, serial: &str) -> Result<Option<u32>> {
+        let newest: Option<i64> = self.conn.query_row(
+            "SELECT MAX(ring_timestamp) FROM events WHERE serial = ?1",
+            [serial],
+            |r| r.get(0),
+        )?;
+        let asleep: Option<i64> = self.conn.query_row(
+            "SELECT MAX(ring_timestamp) FROM events WHERE serial = ?1 AND name IN \
+             ('sleep_acm_period', 'sleep_temp_event')",
+            [serial],
+            |r| r.get(0),
+        )?;
+        Ok(match (newest, asleep) {
+            // Clamped: a sleep epoch that *is* the newest event gives zero,
+            // never a wrap-around into a very large gap.
+            (Some(newest), Some(asleep)) => Some(newest.saturating_sub(asleep).max(0) as u32),
+            _ => None,
+        })
+    }
+
     /// Distinct device serials that have stored events.
     pub fn device_serials(&self) -> Result<Vec<String>> {
         let mut stmt = self
@@ -400,5 +432,65 @@ mod tests {
         // not report something that would skip the first real row.
         let store = Store::open_in_memory().unwrap();
         assert_eq!(store.max_event_id().unwrap(), 0);
+    }
+
+    #[test]
+    fn sleep_gap_measures_from_the_last_sleep_epoch_to_the_newest_event() {
+        // "How long has sleep been over?", in ring-clock deciseconds. Both ends
+        // are ring timestamps, so the answer needs no offset and no wall clock
+        // -- which is the whole reason the phone can ask it before a sync.
+        let store = Store::open_in_memory().unwrap();
+        let put = |name: &'static str, tag: u8, ts: u32| {
+            store
+                .insert_event(
+                    "S1",
+                    &RingEvent { tag, name, timestamp: ts, body: vec![ts as u8], decoded: None },
+                )
+                .unwrap()
+        };
+
+        // Asleep until 1_000, then awake: the ring keeps emitting other streams.
+        put("sleep_acm_period", 0x72, 700);
+        put("sleep_acm_period", 0x72, 1_000);
+        put("spo2_event", 0x6f, 1_500);
+        put("spo2_event", 0x6f, 25_000);
+
+        assert_eq!(store.sleep_gap_ds("S1").unwrap(), Some(24_000));
+    }
+
+    #[test]
+    fn sleep_gap_is_unknown_when_the_ring_has_recorded_no_sleep() {
+        // A fresh store, or a ring that has not slept since it was wiped. The
+        // caller must not read this as "awake for a long time".
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_event(
+                "S1",
+                &RingEvent { tag: 0x6f, name: "spo2_event", timestamp: 500, body: vec![1], decoded: None },
+            )
+            .unwrap();
+
+        assert_eq!(store.sleep_gap_ds("S1").unwrap(), None);
+    }
+
+    #[test]
+    fn sleep_gap_is_zero_while_sleep_is_still_the_newest_thing() {
+        // Mid-night: the last event *is* a sleep epoch. Never negative, and
+        // never a small positive number that a threshold might wave through.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_event(
+                "S1",
+                &RingEvent { tag: 0x6f, name: "spo2_event", timestamp: 400, body: vec![1], decoded: None },
+            )
+            .unwrap();
+        store
+            .insert_event(
+                "S1",
+                &RingEvent { tag: 0x72, name: "sleep_acm_period", timestamp: 900, body: vec![2], decoded: None },
+            )
+            .unwrap();
+
+        assert_eq!(store.sleep_gap_ds("S1").unwrap(), Some(0));
     }
 }
