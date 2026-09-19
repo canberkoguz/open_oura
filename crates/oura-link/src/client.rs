@@ -7,7 +7,7 @@ use oura_protocol::device::{self, Battery, Capability, DeviceInfo};
 use crate::error::{Error, Result};
 use oura_protocol::events::{EventBatchSummary, RingEvent};
 use oura_protocol::protocol::{self, feature, feature_mode, Packet};
-use crate::transport::{transact, Transport};
+use crate::transport::{transact, transact_until, Transport};
 
 /// Default quiet window for collecting responses to a request.
 pub const DEFAULT_QUIET: Duration = Duration::from_millis(1500);
@@ -106,8 +106,31 @@ impl<T: Transport> OuraClient<T> {
         &self.transport
     }
 
+    /// Write a request and collect its whole reply, ending only when the link
+    /// falls quiet.
+    ///
+    /// For requests whose last frame is recognisable, use [`Self::request_until`]
+    /// instead: this one always pays the quiet window in full.
     async fn request(&self, bytes: &[u8]) -> Result<Vec<Packet>> {
         let frames = transact(&self.transport, bytes, self.quiet).await?;
+        Ok(frames.iter().filter_map(|f| Packet::parse(f)).collect())
+    }
+
+    /// Write a request and stop collecting at the frame `done` accepts.
+    ///
+    /// Every caller below reads exactly one field out of one frame of the reply,
+    /// which is what makes stopping at that frame lossless rather than a
+    /// trade: there is nothing later in the reply that the caller would have
+    /// looked at. The drain is the one exception and says why at its call site.
+    ///
+    /// `done` takes a raw frame rather than a [`Packet`]. It runs once per
+    /// inbound frame — 255 of them in an event batch — and reading two bytes off
+    /// the wire is cheaper than parsing a packet that is then parsed again here.
+    async fn request_until<F>(&self, bytes: &[u8], done: F) -> Result<Vec<Packet>>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let frames = transact_until(&self.transport, bytes, self.quiet, done).await?;
         Ok(frames.iter().filter_map(|f| Packet::parse(f)).collect())
     }
 
@@ -129,7 +152,9 @@ impl<T: Transport> OuraClient<T> {
 
     /// Read firmware/version metadata (no auth required).
     pub async fn firmware(&self) -> Result<DeviceInfo> {
-        let packets = self.request(&protocol::req_firmware()).await?;
+        let packets = self
+            .request_until(&protocol::req_firmware(), |f| tag_is(f, 0x09))
+            .await?;
         Self::find(&packets, 0x09)
             .and_then(DeviceInfo::parse)
             .ok_or_else(|| Error::Protocol("no firmware response".into()))
@@ -137,7 +162,9 @@ impl<T: Transport> OuraClient<T> {
 
     /// Read battery state (requires app-auth on rings with a key installed).
     pub async fn battery(&self) -> Result<Battery> {
-        let packets = self.request(&protocol::req_battery()).await?;
+        let packets = self
+            .request_until(&protocol::req_battery(), |f| tag_is(f, 0x0d))
+            .await?;
         Self::find(&packets, 0x0d)
             .and_then(Battery::parse)
             .ok_or_else(|| Error::Protocol("no battery response (auth required?)".into()))
@@ -145,7 +172,9 @@ impl<T: Transport> OuraClient<T> {
 
     /// Read the ring serial number.
     pub async fn serial(&self) -> Result<String> {
-        let packets = self.request(&protocol::product::SERIAL).await?;
+        let packets = self
+            .request_until(&protocol::product::SERIAL, |f| tag_is(f, 0x19))
+            .await?;
         Self::find(&packets, 0x19)
             .and_then(device::parse_product_ascii)
             .ok_or_else(|| Error::Protocol("no serial response".into()))
@@ -153,7 +182,9 @@ impl<T: Transport> OuraClient<T> {
 
     /// Read the hardware id (e.g. `BLB_03`).
     pub async fn hardware_id(&self) -> Result<String> {
-        let packets = self.request(&protocol::product::HARDWARE).await?;
+        let packets = self
+            .request_until(&protocol::product::HARDWARE, |f| tag_is(f, 0x19))
+            .await?;
         Self::find(&packets, 0x19)
             .and_then(device::parse_product_ascii)
             .ok_or_else(|| Error::Protocol("no hardware response".into()))
@@ -163,7 +194,9 @@ impl<T: Transport> OuraClient<T> {
     pub async fn capabilities(&self) -> Result<Vec<Capability>> {
         let mut caps = Vec::new();
         for page in 0u8..2 {
-            let packets = self.request(&protocol::req_capabilities(page)).await?;
+            let packets = self
+                .request_until(&protocol::req_capabilities(page), |f| ext_tag_is(f, 0x02))
+                .await?;
             if let Some(p) = packets.iter().find(|p| p.ext_tag() == Some(0x02)) {
                 caps.extend(device::parse_capabilities(p));
             }
@@ -181,7 +214,9 @@ impl<T: Transport> OuraClient<T> {
     /// [`Error::Protocol`]: neither says anything about the key, and callers
     /// treat `Auth` as "retrying will never help".
     pub async fn authenticate(&self, key: &[u8; 16]) -> Result<AuthResult> {
-        let packets = self.request(&protocol::req_auth_nonce()).await?;
+        let packets = self
+            .request_until(&protocol::req_auth_nonce(), |f| ext_tag_is(f, 0x2c))
+            .await?;
         let nonce = packets
             .iter()
             .find(|p| p.ext_tag() == Some(0x2c))
@@ -189,7 +224,11 @@ impl<T: Transport> OuraClient<T> {
             .ok_or_else(|| Self::missing(&packets, "nonce"))?;
 
         let encrypted = encrypt_nonce(key, &nonce);
-        let packets = self.request(&protocol::req_authenticate(&encrypted)).await?;
+        let packets = self
+            .request_until(&protocol::req_authenticate(&encrypted), |f| {
+                ext_tag_is(f, 0x2e)
+            })
+            .await?;
         let state = packets
             .iter()
             .find(|p| p.ext_tag() == Some(0x2e))
@@ -215,12 +254,21 @@ impl<T: Transport> OuraClient<T> {
     }
 
     /// Align the ring clock to host UTC.
+    ///
+    /// The terminator here is inferred rather than captured. The protocol
+    /// cheatsheet in `docs/` records only that `0x12` gets a "success-shaped
+    /// response", without its tag; every other request/response pair we *have*
+    /// captured is consecutive (`0x08`/`0x09`, `0x0c`/`0x0d`, `0x10`/`0x11`,
+    /// `0x18`/`0x19`, `0x24`/`0x25`, `0x28`/`0x29`), which puts this one at
+    /// `0x13`. Guessing is free: the reply is discarded either way, and a wrong
+    /// tag just means waiting out the quiet window as before.
     pub async fn sync_time(&self) -> Result<()> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        self.request(&protocol::req_sync_time(now, 0)).await?;
+        self.request_until(&protocol::req_sync_time(now, 0), |f| tag_is(f, 0x13))
+            .await?;
         Ok(())
     }
 
@@ -261,8 +309,46 @@ impl<T: Transport> OuraClient<T> {
         let mut total = 0u32;
         // Safety bound against a misbehaving ring that never reports drained.
         for _ in 0..100_000 {
+            // The batch's events arrive and are then closed by the `0x11`
+            // summary that counts them (the protocol cheatsheet in `docs/`,
+            // "Captured Events"). Stopping there instead of on silence is
+            // the single biggest thing in a sync: measured against a real ring a
+            // 255-event batch transfers in ~0.6 s and then spent ~1.5 s waiting
+            // out the window, so a night's hundred batches lost ~150 s to it.
+            //
+            // The `seen_event` guard is what makes an *observed* terminator safe
+            // to act on. Were the ordering ever the other way round, stopping at
+            // the summary would leave the batch's events unread — and because
+            // `progressed` would then be false while `bytes_left` was not, the
+            // drain would stop with the backlog still there. Requiring an event
+            // first means a ring that summarises up front simply never triggers
+            // the early exit and falls back to the quiet window. The cost is one
+            // window on a batch that is genuinely empty, which is the sync that
+            // had nothing to do anyway.
+            //
+            // Only an event at or after `start` arms it, because only such an
+            // event can be an answer to *this* request. Returning early is what
+            // makes that distinction matter: the reply now ends before the link
+            // is known to be quiet, so a frame the ring emits after its summary
+            // lands in the next batch's window instead, and nothing below the
+            // transport correlates a frame to the request it answers. Such a
+            // stray is always older than the cursor it arrives behind — that is
+            // what makes it recognisable — and arming on one would let the next
+            // summary cut the batch short before its real events.
+            let mut seen_event = false;
             let packets = self
-                .request(&protocol::req_get_event(start, 255, -1))
+                .request_until(&protocol::req_get_event(start, 255, -1), |f| {
+                    match f.first() {
+                        Some(&0x11) => seen_event,
+                        Some(&t) if t >= protocol::HISTORY_EVENT_PREFIX => {
+                            if in_range(f, start) {
+                                seen_event = true;
+                            }
+                            false
+                        }
+                        _ => false,
+                    }
+                })
                 .await?;
 
             let mut summary: Option<EventBatchSummary> = None;
@@ -273,6 +359,12 @@ impl<T: Transport> OuraClient<T> {
                     summary = EventBatchSummary::parse(p);
                 } else if p.tag >= protocol::HISTORY_EVENT_PREFIX {
                     let ev = RingEvent::from_packet(p);
+                    // Same range test as the terminator above, and for the same
+                    // reason: counting a stray would inflate `events_synced` and
+                    // hand the caller an event it has already stored.
+                    if ev.timestamp < start {
+                        continue;
+                    }
                     max_ts = max_ts.max(ev.timestamp);
                     batch_events += 1;
                     total += 1;
@@ -352,7 +444,9 @@ impl<T: Transport> OuraClient<T> {
     /// Trigger the ring's sleep analysis. Returns the `0x29` status byte.
     pub async fn check_sleep_analysis(&self, force: bool) -> Result<u8> {
         let packets = self
-            .request(&protocol::req_check_sleep_analysis(force))
+            .request_until(&protocol::req_check_sleep_analysis(force), |f| {
+                tag_is(f, 0x29)
+            })
             .await?;
         Self::find(&packets, 0x29)
             .and_then(|p| p.payload.first().copied())
@@ -549,6 +643,34 @@ impl<T: Transport> OuraClient<T> {
     }
 }
 
+/// Does this frame carry response tag `tag`?
+///
+/// Reads the wire bytes directly — see [`OuraClient::request_until`] for why
+/// these are not expressed over [`Packet`]. The framing is `[tag, len,
+/// payload..]`, and for extended ops the first payload byte is the op tag.
+fn tag_is(frame: &[u8], tag: u8) -> bool {
+    frame.first() == Some(&tag)
+}
+
+/// Does this frame carry extended (`0x2f`) response op `ext`?
+fn ext_tag_is(frame: &[u8], ext: u8) -> bool {
+    frame.first() == Some(&0x2f) && frame.get(2) == Some(&ext)
+}
+
+/// Is this history-event frame an answer to a `GetEvent` from `start`?
+///
+/// An event frame is `[tag, len, timestamp(4, LE), body..]`, so this is four
+/// bytes off the wire — cheap enough to run on all 255 frames of a batch, which
+/// is why the drain's terminator is expressed over frames and not [`Packet`]s.
+/// A frame too short to hold a timestamp is not an event we can place, so it is
+/// not treated as one.
+fn in_range(frame: &[u8], start: u32) -> bool {
+    match frame.get(2..6) {
+        Some(ts) => u32::from_le_bytes([ts[0], ts[1], ts[2], ts[3]]) >= start,
+        None => false,
+    }
+}
+
 /// Parse an ACM measurement indication (response tag `0x33`) into up to 2 samples.
 ///
 /// Frame: `[0]=0x33 [1]=len [2]=sampleRate [3]=seq [4..10]=x,y,z [10..16]=x,y,z?`,
@@ -682,6 +804,145 @@ mod tests {
         mock.on(AUTHENTICATE_REQUEST, &["2f022e03"]);
         let err = authenticate_against(mock).await.unwrap_err();
         assert!(matches!(err, Error::Auth(_)), "got {err:?}");
+    }
+
+    // --- stopping at the last frame instead of on silence -------------------
+
+    /// The real window, against a paused clock: these assert that it was never
+    /// entered, not that the machine is fast.
+    const REAL_QUIET: Duration = DEFAULT_QUIET;
+
+    const GET_EVENTS_FROM_0: &str = "100900000000ffffffffff";
+    const GET_EVENTS_FROM_11: &str = "10090b000000ffffffffff";
+    /// `[count=1, sleep_progress=0, bytes_left]`.
+    const SUMMARY_MORE_LEFT: &str = "110601000a000000";
+    const SUMMARY_DRAINED: &str = "1106010000000000";
+    /// `debug_event` (0x43) at deciseconds 10 and 20.
+    const EVENT_AT_10: &str = "43050a000000aa";
+    const EVENT_AT_20: &str = "430514000000bb";
+
+    #[tokio::test(start_paused = true)]
+    async fn a_metadata_read_returns_on_its_response_tag() {
+        let mock = MockTransport::new();
+        mock.on(
+            "0803000000",
+            &["091202000003040301000105000cffeeddccbbaa"],
+        );
+        let client = OuraClient::new(mock).with_quiet(REAL_QUIET);
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(client.firmware().await.unwrap().firmware_version, "3.4.3");
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn authenticating_costs_no_quiet_windows() {
+        let mock = MockTransport::new();
+        mock.on(NONCE_REQUEST, &[NONCE_REPLY]);
+        mock.on(AUTHENTICATE_REQUEST, &["2f022e00"]);
+
+        let client = OuraClient::new(mock).with_quiet(REAL_QUIET);
+        let key: [u8; 16] = hex::decode(AUTH_KEY).unwrap().try_into().unwrap();
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(client.authenticate(&key).await.unwrap(), AuthResult::Success);
+        assert_eq!(started.elapsed(), Duration::ZERO, "two requests, no windows");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_returns_on_each_batch_summary() {
+        // Two batches, both closed by a `0x11`. Before the summary was treated as
+        // the terminator this cost one quiet window per batch, which against a
+        // night's hundred batches was two thirds of the whole sync.
+        let mock = MockTransport::new();
+        mock.on(GET_EVENTS_FROM_0, &[EVENT_AT_10, SUMMARY_MORE_LEFT]);
+        mock.on(GET_EVENTS_FROM_11, &[EVENT_AT_20, SUMMARY_DRAINED]);
+        let client = OuraClient::new(mock).with_quiet(REAL_QUIET);
+
+        let started = tokio::time::Instant::now();
+        let mut seen = Vec::new();
+        let outcome = client
+            .drain_events(0, |ev| seen.push(ev.timestamp), |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(seen, vec![10, 20]);
+        assert_eq!(outcome.events_synced, 2);
+        assert_eq!(outcome.next_cursor, 21);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_summary_before_the_events_still_drains_the_batch() {
+        // The ordering is observed, not guaranteed, and getting it wrong must not
+        // cost events: a ring that summarised up front would otherwise have its
+        // batch cut off before the events, and the drain would stop with the
+        // backlog still on the ring. Instead the early exit simply never fires.
+        let mock = MockTransport::new();
+        mock.on(GET_EVENTS_FROM_0, &[SUMMARY_MORE_LEFT, EVENT_AT_10]);
+        mock.on(GET_EVENTS_FROM_11, &[SUMMARY_DRAINED, EVENT_AT_20]);
+        let client = OuraClient::new(mock).with_quiet(REAL_QUIET);
+
+        let started = tokio::time::Instant::now();
+        let mut seen = Vec::new();
+        let outcome = client
+            .drain_events(0, |ev| seen.push(ev.timestamp), |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(seen, vec![10, 20], "no event may be lost to a wrong guess");
+        assert_eq!(outcome.next_cursor, 21);
+        assert_eq!(started.elapsed(), 2 * REAL_QUIET, "one window per batch");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_trailing_one_batch_is_not_counted_against_the_next() {
+        // Returning at the summary ends the reply before the link is known to be
+        // quiet, so a frame the ring emits after it arrives inside the *next*
+        // batch's window. It is recognisable by being older than the cursor it
+        // turned up behind, and counting it would hand the caller an event it
+        // has already stored and overstate `events_synced`.
+        let mock = MockTransport::new();
+        mock.on(GET_EVENTS_FROM_0, &[EVENT_AT_10, SUMMARY_MORE_LEFT]);
+        mock.on(
+            GET_EVENTS_FROM_11,
+            &[EVENT_AT_10, EVENT_AT_20, SUMMARY_DRAINED],
+        );
+        let client = OuraClient::new(mock).with_quiet(REAL_QUIET);
+
+        let mut seen = Vec::new();
+        let outcome = client
+            .drain_events(0, |ev| seen.push(ev.timestamp), |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(seen, vec![10, 20], "the trailing frame is not an event here");
+        assert_eq!(outcome.events_synced, 2);
+        assert_eq!(outcome.next_cursor, 21);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_trailing_frame_cannot_arm_the_early_exit() {
+        // The same stray, but ahead of a summary that the batch's real events
+        // follow. Arming on it would stop the read at that summary and lose
+        // `EVENT_AT_20` for good: the cursor advances on the stray, so the drain
+        // moves past 20 and no later sync goes back for it.
+        let mock = MockTransport::new();
+        mock.on(GET_EVENTS_FROM_0, &[EVENT_AT_10, SUMMARY_MORE_LEFT]);
+        mock.on(
+            GET_EVENTS_FROM_11,
+            &[EVENT_AT_10, SUMMARY_DRAINED, EVENT_AT_20],
+        );
+        let client = OuraClient::new(mock).with_quiet(REAL_QUIET);
+
+        let mut seen = Vec::new();
+        let outcome = client
+            .drain_events(0, |ev| seen.push(ev.timestamp), |_, _| {})
+            .await
+            .unwrap();
+
+        assert_eq!(seen, vec![10, 20], "the batch's own event must survive");
+        assert_eq!(outcome.next_cursor, 21);
     }
 
     #[test]

@@ -180,10 +180,18 @@ impl SyncProgress for RecordingProgress {
 
 /// Wire a fake ring to a session over a fresh database.
 fn session_with(ring: Arc<FakeRing>) -> (Arc<RingSession>, tempfile::TempDir) {
+    session_with_quiet(ring, TEST_QUIET)
+}
+
+/// The same, with the per-request window named — for the one test that is about
+/// how often that window is entered.
+fn session_with_quiet(
+    ring: Arc<FakeRing>,
+    quiet: Duration,
+) -> (Arc<RingSession>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("ring.db");
-    let session =
-        RingSession::open(ring.clone(), db.to_str().unwrap(), TEST_QUIET).unwrap();
+    let session = RingSession::open(ring.clone(), db.to_str().unwrap(), quiet).unwrap();
     *ring.session.lock().unwrap() = Arc::downgrade(&session);
     (session, dir)
 }
@@ -258,6 +266,45 @@ fn sync_authenticates_drains_and_reports() {
     // Cursor lands one past the newest event's timestamp (24 * 10).
     assert_eq!(report.next_cursor, 241);
     assert_eq!(report.max_event_id, 25);
+}
+
+#[test]
+fn a_backlog_does_not_cost_a_quiet_window_per_batch() {
+    // The reason the first sync of the morning was minutes long. A night is
+    // ~18-25k events at 255 per batch, so ~100 `GetEvent` round trips; each one
+    // transferred in ~0.6 s against a real ring and then sat in the quiet window
+    // for 1.5 s more, which is where two thirds of the sync went.
+    //
+    // Timed rather than counted, because the thing being asserted is the waiting
+    // and there is nothing else to observe it by. The window here is deliberately
+    // long relative to a scripted ring's answers: 40 batches plus a handshake
+    // would be > 6 s if every request paid it, and the only requests that still
+    // should are the three this fake ring never answers (two capability pages,
+    // which it declines, and `sync_time`, which it has no reply for).
+    const QUIET: Duration = Duration::from_millis(150);
+    let ring = FakeRing::new(sample_events(400), 10);
+    let (session, _dir) = session_with_quiet(ring.clone(), QUIET);
+
+    let started = Instant::now();
+    let report = session.run_sync(KEY.to_vec(), true, false, None).unwrap();
+    let elapsed = started.elapsed();
+
+    assert_eq!(report.events_received, 400);
+    assert_eq!(report.rows_inserted, 400);
+    assert!(
+        ring.request_count() >= 40,
+        "the drain should still have taken 40 batches, not one big read: {}",
+        ring.request_count()
+    );
+    // Loose on purpose. Three requests pay the window no matter what, which is
+    // a 450 ms floor under a 750 ms bound -- too little room for a contended
+    // runner, and it buys nothing: the regression costs 40 windows, so anything
+    // under ~6 s separates the two just as sharply.
+    assert!(
+        elapsed < 15 * QUIET,
+        "a 40-batch drain took {elapsed:?} -- that is a quiet window per batch, \
+         not a return on the 0x11 summary"
+    );
 }
 
 #[test]

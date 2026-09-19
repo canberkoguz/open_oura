@@ -16,6 +16,11 @@ async-trait = "0.1"
 futures = { version = "0.3", optional = true }
 btleplug = { version = "0.11", optional = true }
 
+[dev-dependencies]
+# `test-util` gives the tests a paused clock, so they can assert that a request
+# skipped its quiet window rather than timing how fast the machine is.
+tokio = { version = "1", features = ["test-util"] }
+
 [features]
 default = ["ble"]
 # The btleplug BLE transport. Off for the iOS FFI build, where CoreBluetooth
